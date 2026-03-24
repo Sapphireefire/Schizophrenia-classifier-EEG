@@ -1,0 +1,87 @@
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import StratifiedKFold
+from sklearn.svm import LinearSVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score
+
+# 1) Load epoch-level features and metadata 
+X_epochs = np.load("X_schizo_features_with_connectivity_DE.npy")  
+y_epochs = np.load("y_schizo_labels.npy")
+subjects = np.load("subject_ids.npy")
+
+print("Epoch-level features (with DE):", X_epochs.shape)
+
+# 2) Aggregate epochs → subject-level
+unique_subs = np.unique(subjects)
+X_subj_list = []
+y_subj_list = []
+
+for sub in unique_subs:
+    idx = np.where(subjects == sub)[0]
+    X_sub = X_epochs[idx]       # (n_epochs_for_sub, n_features)
+    y_sub = y_epochs[idx]       # (n_epochs_for_sub,)
+
+    assert np.all(y_sub == y_sub[0]), f"Subject {sub} has multiple labels!"
+
+    # ----------- MODIFIED PART ONLY -----------
+    feat_mean = X_sub.mean(axis=0)
+    feat_std  = X_sub.std(axis=0)
+    feat_subj = np.concatenate([feat_mean, feat_std])  # (2 * n_features,)
+    X_subj_list.append(feat_subj)
+    # ------------------------------------------
+
+    y_subj_list.append(y_sub[0])
+
+X_subj = np.vstack(X_subj_list)      # (n_subjects, 2 * n_features)
+y_subj = np.array(y_subj_list)       # (n_subjects,)
+
+print("Subject-level feature matrix (with DE):", X_subj.shape)
+
+# 3) 5-fold subject-level CV with SVM top-40 + mild-reg XGBoost
+n_splits = 5
+K = 80
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+fold_accs = []
+
+for fold, (train_idx, test_idx) in enumerate(skf.split(X_subj, y_subj), start=1):
+    X_train, X_test = X_subj[train_idx], X_subj[test_idx]
+    y_train, y_test = y_subj[train_idx], y_subj[test_idx]
+
+    # Feature selection via linear SVM on training subjects only
+    fs_pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("svm", LinearSVC(C=1.0, penalty="l2", dual=False,
+                          max_iter=5000, random_state=42))
+    ])
+    fs_pipeline.fit(X_train, y_train)
+    coef = fs_pipeline.named_steps["svm"].coef_.ravel()
+
+    top_idx = np.argsort(np.abs(coef))[::-1][:K]
+    X_train_sel = X_train[:, top_idx]
+    X_test_sel  = X_test[:, top_idx]
+
+    model = xgb.XGBClassifier(
+        n_estimators=150,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.5,   # mild L2
+        reg_alpha=0.3,    # mild L1
+        min_child_weight=2,
+        tree_method='hist',
+        eval_metric='logloss',
+        random_state=42
+    )
+    model.fit(X_train_sel, y_train)
+    y_pred = model.predict(X_test_sel)
+    acc = accuracy_score(y_test, y_pred)
+    fold_accs.append(acc)
+    print(f"Fold {fold}: subject-level accuracy = {acc:.3f}")
+
+print("\n" + "="*60)
+print(f"Mean subject-level accuracy over {n_splits} folds (XGB + DE features, K={K}): {np.mean(fold_accs):.3f}")
+
+print("="*60)

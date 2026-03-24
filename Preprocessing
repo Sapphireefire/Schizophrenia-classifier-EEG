@@ -1,0 +1,135 @@
+!pip install mne mne-icalabel asrpy
+
+
+
+import os
+import glob
+import numpy as np
+import mne
+import asrpy
+from mne.preprocessing import ICA
+from mne_icalabel import label_components
+
+
+def advanced_preprocessing_pipeline(file_path):
+    print(f"Processing: {os.path.basename(file_path)}...")
+    
+    # 1. Load Data
+    try:
+        raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
+
+    # Select only 19 standard channels
+    standard_chans = ['Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T3', 'C3', 'Cz', 'C4', 'T4', 'T5', 'P3', 'Pz', 'P4', 'T6', 'O1', 'O2']
+    
+    # Check if channels exist
+    if not all(ch in raw.ch_names for ch in standard_chans):
+        print(f"Skipping {file_path}: Missing channels.")
+        return None
+        
+    raw.pick_channels(standard_chans)
+    
+    # Set Montage (Crucial for ICLabel)
+    montage = mne.channels.make_standard_montage('standard_1020')
+    raw.set_montage(montage)
+
+    # 2. Band-pass Filter (0.5 - 45 Hz)
+    raw.filter(l_freq=0.5, h_freq=45.0, fir_design='firwin', verbose=False)
+
+    # 3. ASR Cleaning (Cutoff=17 matches paper)
+    try:
+        asr = asrpy.ASR(sfreq=raw.info['sfreq'], cutoff=17)
+        asr.fit(raw)
+        raw_clean = asr.transform(raw)
+    except Exception as e:
+        print(f"ASR failed on {file_path}, using raw filtered: {e}")
+        raw_clean = raw # Fallback if ASR fails on weird data
+
+    # 4. Re-referencing (Average)
+    raw_clean.set_eeg_reference('average', projection=False, verbose=False)
+
+    # 5. ICA + ICLabel
+    # High-pass filter copy for ICA fit
+    raw_ica_fit = raw_clean.copy().filter(l_freq=1.0, h_freq=45.0, verbose=False)
+    
+    # Fit ICA
+    ica = ICA(n_components=15, method='fastica', random_state=42, max_iter='auto')
+
+    ica.fit(raw_ica_fit, verbose=False)
+    
+    # ICLabel
+    component_labels = label_components(raw_clean, ica, method='iclabel')
+    exclude_idx = []
+    for idx, (label, prob) in enumerate(zip(component_labels['labels'], component_labels['y_pred_proba'])):
+        if label in ['eye', 'muscle'] and prob > 0.8:
+            exclude_idx.append(idx)
+            
+    ica.exclude = exclude_idx
+    raw_final = ica.apply(raw_clean, verbose=False)
+
+    # 6. Epoching (5 seconds)
+    epochs = mne.make_fixed_length_epochs(raw_final, duration=5.0, overlap=0, verbose=False)
+    
+    return epochs.get_data(copy=True)
+
+
+def main():
+    
+    data_folder = r"Your_folder"
+    
+    # Lists to store final data
+    X = [] # Data
+    y = [] # Labels (1=Schizo, 0=Healthy)
+    
+    # Get all .edf files
+    edf_files = glob.glob(os.path.join(data_folder, "*.edf"))
+    
+    if not edf_files:
+        print("No .edf files found! Check the path.")
+        return
+
+    print(f"Found {len(edf_files)} files. Starting batch processing...")
+
+    for file_path in edf_files:
+        filename = os.path.basename(file_path).lower()
+        
+       
+        if filename.startswith('h'):
+            label = 0
+        elif filename.startswith('s'):
+            label = 1
+        else:
+            print(f"Skipping unknown file prefix: {filename}")
+            continue
+            
+     
+        epochs_data = advanced_preprocessing_pipeline(file_path)
+        
+        if epochs_data is not None:
+            # Append data
+            # epochs_data shape is (N_epochs, 19, Time)
+            X.append(epochs_data)
+            # Create labels for each epoch (same label for all epochs of one subject)
+            y.extend([label] * epochs_data.shape[0])
+            print(f"  -> Added {epochs_data.shape[0]} epochs. Label: {label}")
+
+
+    if X:
+        X_final = np.vstack(X) # Shape: (Total_Epochs, 19, Time)
+        y_final = np.array(y)
+        
+        print("\n=== PROCESSING COMPLETE ===")
+        print(f"Final Data Shape: {X_final.shape}")
+        print(f"Final Labels Shape: {y_final.shape}")
+        
+        # Save to disk so you don't have to run this again!
+        np.save("X_schizo_preprocessed.npy", X_final)
+        np.save("y_schizo_labels.npy", y_final)
+        print("Saved to X_schizo_preprocessed.npy and y_schizo_labels.npy")
+    else:
+        print("No data was processed.")
+
+if __name__ == "__main__":
+    main()
